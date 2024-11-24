@@ -611,13 +611,16 @@ int main(int argc, char** argv) {
 	// ####################################################################################
 
     // Prepare FFTW plan (reuse plan to save time)
-    rank_0_cout(rank, "Prepare FFTW plan (reuse plan to save time) ...");
-    double* dummy_in = new double[segment_length];
-    fftw_complex* dummy_out = new fftw_complex[num_freq_bins];
-    fftw_plan plan_forward = fftw_plan_dft_r2c_1d(segment_length, dummy_in, dummy_out, FFTW_MEASURE);
-    assert(plan_forward != nullptr); // Check for null plan
-    delete[] dummy_in;
-    delete[] dummy_out;    
+//    rank_0_cout(rank, "Prepare FFTW plan (reuse plan to save time) ...");
+//    double* dummy_in = new double[segment_length];
+//    fftw_complex* dummy_out = new fftw_complex[num_freq_bins];
+//    fftw_plan plan_forward = fftw_plan_dft_r2c_1d(segment_length, dummy_in, dummy_out, FFTW_MEASURE);
+//    assert(plan_forward != nullptr); // Check for null plan
+//    delete[] dummy_in;
+//    delete[] dummy_out;   
+
+//fftw_plan plan_forward = fftw_plan_dft_r2c_1d(segment_length, NULL, NULL, FFTW_MEASURE);
+//assert(plan_forward != nullptr); // Check for null plan 
 
     // Estimate required memory
     rank_0_cout(rank, "Estimate required memory ...");
@@ -682,9 +685,12 @@ int main(int argc, char** argv) {
                 for (int grid_index = 0; grid_index < NUM_GRIDS; ++grid_index) {
                     ptrdiff_t local_size = local_sizes[grid_index];
                     ptrdiff_t start_idx = start_indices[grid_index];
-
+                    
                     for (ptrdiff_t i = 0; i < local_size; ++i) {
-                        time_data[var][(start_idx + i) * segment_length + t] = (data[time_idx * total_local_size + i] - mean_data[i]) * window[t];
+                    
+												int i_global = start_global_indices[grid_index] + local_0_starts[grid_index]*N1s[grid_index]*N2s[grid_index] + i;                     
+                    
+                        time_data[var][(start_idx + i) * segment_length + t] = (data[time_idx * total_global_size + i_global] - mean_data[i_global]) * window[t];
      
                     }
                 }
@@ -698,13 +704,37 @@ int main(int argc, char** argv) {
         rank_0_cout(rank, "Perform FFT over time for each spatial point and variable ...");
         for (int var = 0; var < NUM_VARIABLES; ++var) {
         	rank_0_cout(rank, "seg = ",seg,": var = ",var," of ",NUM_VARIABLES);
-            // Reuse the FFTW plan
+        	
             for (ptrdiff_t i = 0; i < total_local_size; ++i) {
-                double* in = &time_data[var][i * segment_length];
-                fftw_complex* out = new fftw_complex[num_freq_bins];
-                fftw_execute_dft_r2c(plan_forward, in, out);
+
+//						double* dummy_in = new double[segment_length];
+//						fftw_complex* dummy_out = new fftw_complex[num_freq_bins];
+//						fftw_plan plan_forward = fftw_plan_dft_r2c_1d(segment_length, dummy_in, dummy_out, FFTW_MEASURE);
+//						assert(plan_forward != nullptr); // Check for null plan
+//						delete[] dummy_in;
+//						delete[] dummy_out;  
+            
+//                double* in = &time_data[var][i * segment_length];
+//                fftw_complex* out = new fftw_complex[num_freq_bins];
+//                fftw_execute_dft_r2c(plan_forward, in, out);
+
+
+								// Allocate input and output arrays
+//								rank_0_cout(rank, "Allocate input and output arrays ...");
+								fftw_complex* out = fftw_alloc_complex(num_freq_bins);  
+								double* in = &time_data[var][i * segment_length];
+								
+								// Setup the plan
+//								rank_0_cout(rank, "Setup the plan ...");
+								fftw_plan plan_forward = fftw_plan_dft_r2c_1d(segment_length, in, out, FFTW_ESTIMATE);
+								assert(plan_forward != nullptr);
+
+								// Execute the FFT
+//								rank_0_cout(rank, "Execute the FFT ...");
+								fftw_execute(plan_forward);
 
                 // Store FFT output for each frequency
+//                rank_0_cout(rank, "Store FFT output for each frequency ...");
                 for (int freq = 0; freq < num_freq_bins; ++freq) {
                     PetscScalar value = out[freq][0] + PETSC_i * out[freq][1];
                     size_t index = ((size_t)freq) * ((size_t)num_segments) * ((size_t)total_local_size) * NUM_VARIABLES +
@@ -713,8 +743,11 @@ int main(int argc, char** argv) {
                     Q_frequencies[index] = (1.0/(mean_window*segment_length))*value;
                 }
                 
-				// Deallocate memory for `out`
-				delete[] out;                
+								// Cleanup
+//								rank_0_cout(rank, "Cleanup ...");
+								fftw_destroy_plan(plan_forward);
+								fftw_free(out);
+
             }
         }
     }
@@ -730,34 +763,48 @@ int main(int argc, char** argv) {
     PetscReal avg_magnitude = 0.0;
     double peak_frequency = 0.0;    
     int var = 0;
-	for (int freq = 0; freq < num_freq_bins; ++freq) {
 
-	// Average the magnitude over all segments
-	PetscReal sum_magnitude = 0.0;
-	for (int seg = 0; seg < num_segments; ++seg) {
-	
-		for (int i = 0; i < total_local_size; ++i) {
+    rank_0_cout(rank, "Loop through the data structure to find peak frequency...");
 
-		// Create a vector for the i-th component
-		size_t index = ((size_t)freq) * ((size_t)num_segments) * ((size_t)total_local_size) * NUM_VARIABLES +
-		((size_t)seg) * ((size_t)total_local_size) * NUM_VARIABLES +
-		((size_t)i) * NUM_VARIABLES + var;                  
+    for (int freq = 0; freq < num_freq_bins; ++freq) {
+        double sum_magnitude_local = 0.0;
 
-		std::vector<PetscScalar> vec = { Q_frequencies[index] };
-		sum_magnitude += computeMagnitude(vec);
-		
-		}
-	}
-	avg_magnitude = sum_magnitude / num_segments;
+        // Compute sum_magnitude on each processor
+        for (int seg = 0; seg < num_segments; ++seg) {
+            for (int i = 0; i < total_local_size; ++i) {
+                size_t index = static_cast<size_t>(freq) * num_segments * total_local_size * NUM_VARIABLES +
+                               static_cast<size_t>(seg) * total_local_size * NUM_VARIABLES +
+                               static_cast<size_t>(i) * NUM_VARIABLES + var;
 
-	// Update the maximum magnitude if necessary
-	if (avg_magnitude > max_magnitude) {
-		max_magnitude = avg_magnitude;
-		peak_frequency = frequencies[freq];
-	}        
+                std::vector<PetscScalar> vec = { Q_frequencies[index] };
+                sum_magnitude_local += computeMagnitude(vec);
+            }
+        }
 
-	rank_0_cout(rank, "At frequencies[",freq,"] = ",frequencies[freq],": avg_magnitude = ",avg_magnitude);
-	}
+        // Reduce sum_magnitude across all processes
+        double sum_magnitude_global = 0.0;
+        MPI_Reduce(&sum_magnitude_local, &sum_magnitude_global, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+
+        double avg_magnitude = 0.0;
+        if (rank == 0) {
+            avg_magnitude = sum_magnitude_global / num_segments;
+
+            // Update the maximum magnitude and peak frequency
+            if (avg_magnitude > max_magnitude) {
+                max_magnitude = avg_magnitude;
+                peak_frequency = frequencies[freq];
+            }
+
+            // Print the results
+            std::cout << "At frequencies[" << freq << "] = " << frequencies[freq]
+                      << ": avg_magnitude = " << avg_magnitude << std::endl;
+        }
+    }
+
+    if (rank == 0) {
+        std::cout << "Peak frequency: " << peak_frequency
+                  << " with max magnitude: " << max_magnitude << std::endl;
+    }	
 
 //    // Verify that peak frequency matches f0
 //    rank_0_cout(rank, "Verify that peak frequency matches f0 ...");
@@ -778,8 +825,8 @@ int main(int argc, char** argv) {
 // %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%    
     
 
-    // Clean up
-    fftw_destroy_plan(plan_forward);
+//    // Clean up
+//    fftw_destroy_plan(plan_forward);
 
     for (int var = 0; var < NUM_VARIABLES; ++var) {
         delete[] time_data[var];
@@ -812,7 +859,6 @@ int main(int argc, char** argv) {
 
   // Set diagonal values from weight_vec_petsc
   MatDiagonalSet(W, weight_vec_petsc, INSERT_VALUES);
-
 
 	// %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -942,7 +988,7 @@ int main(int argc, char** argv) {
 		    PetscScalar lambda_sqrt_inv = 1.0 / PetscSqrtScalar(eigenvalues[mode]);
 		    Vec phi;
 		    VecCreate(comm, &phi);
-		    VecSetSizes(phi, PETSC_DECIDE, total_local_size * NUM_VARIABLES);
+		    VecSetSizes(phi, PETSC_DECIDE, total_global_size * NUM_VARIABLES);
 		    VecSetFromOptions(phi);
 
 		    // Multiply Q * v
@@ -997,4 +1043,3 @@ int main(int argc, char** argv) {
 	rank_0_cout(rank, "Program Done!");    
     
 }
-
